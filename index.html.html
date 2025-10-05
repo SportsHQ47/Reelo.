@@ -1,0 +1,1044 @@
+<meta name='viewport' content='width=device-width, initial-scale=1'/><!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Reelo - Social Network</title>
+    <!-- Load Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #000000; /* Deep black background */
+            color: #ffffff;
+            transition: background-color 0.3s;
+        }
+        /* Custom scrollbar for stories */
+        .stories-scroll::-webkit-scrollbar {
+            height: 6px;
+        }
+        .stories-scroll::-webkit-scrollbar-thumb {
+            background-color: #3f3f46; /* Gray-700 */
+            border-radius: 3px;
+        }
+        .story-ring {
+            border: 2px solid transparent;
+            background-image: linear-gradient(#000, #000), 
+                              linear-gradient(45deg, #f09433, #e6683c, #dc2743, #cc2366, #bc1888);
+            background-origin: border-box;
+            background-clip: content-box, border-box;
+            padding: 2px;
+        }
+        .reelo-logo {
+            font-family: 'Inter', cursive; /* Using Inter but italic/bold for style */
+            font-style: italic;
+            font-weight: 800;
+            text-shadow: 0 0 5px rgba(236, 72, 153, 0.5); /* Pink shadow */
+            color: #ec4899; /* Pink color */
+        }
+        /* Modal backdrop styling */
+        .modal-backdrop {
+            background-color: rgba(0, 0, 0, 0.75);
+            backdrop-filter: blur(5px);
+        }
+    </style>
+    <!-- Firebase SDK Imports -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        // CRITICAL FIX: Ensure all auth methods are imported
+        import { getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, onAuthStateChanged, signOut, signInAnonymously, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, addDoc, updateDoc, onSnapshot, collection, query, serverTimestamp, arrayUnion, arrayRemove, setDoc, getDoc, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        
+        // Use setLogLevel('Debug') to see all logs in the console
+        setLogLevel('Debug');
+
+        // Global Firebase variables (MANDATORY)
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        let firebaseConfig = null;
+        
+        if (typeof __firebase_config !== 'undefined' && __firebase_config) {
+            try {
+                firebaseConfig = JSON.parse(__firebase_config);
+            } catch (error) {
+                console.error("FIREBASE CONFIG ERROR: Failed to parse configuration string. Is it valid JSON?", error);
+            }
+        }
+
+        let app;
+        let db;
+        let auth;
+        let userId = null;
+        let postsData = []; // Array to hold real-time post data (all posts)
+        let userProfileData = { following: [], followers: [], username: 'Loading...', bio: '' }; // Current user's metadata
+        let currentPage = 'login'; 
+
+        // --- Utility Functions ---
+
+        function getPostPath(postId) {
+            return doc(db, `artifacts/${appId}/public/data/posts`, postId);
+        }
+        
+        function getUserProfilePath(id) {
+            // Store user metadata publicly by their ID for easy lookup of followers/following
+            return doc(db, `artifacts/${appId}/public/data/users_metadata`, id);
+        }
+
+        /**
+         * Simple state rendering function
+         */
+        window.renderUI = function() {
+            const appContainer = document.getElementById('reelo-app-container');
+            if (!appContainer) return;
+            
+            const isAuthenticated = auth && userId;
+
+            if (isAuthenticated) {
+                // Ensure we are not stuck on a login/signup screen if authenticated
+                if (currentPage === 'login' || currentPage === 'signup') {
+                    currentPage = 'feed';
+                }
+                
+                appContainer.innerHTML = createAuthenticatedLayout();
+                
+                // Render the specific content
+                if (currentPage === 'feed') {
+                    renderFeedContent();
+                } else if (currentPage === 'messages') {
+                    renderMessagesContent();
+                } else if (currentPage === 'newPost') {
+                    renderNewPostContent();
+                } else if (currentPage === 'profile') {
+                    renderProfileContent();
+                }
+            } else {
+                // If NOT authenticated, show login/signup
+                appContainer.innerHTML = currentPage === 'signup' ? createSignupScreen() : createLoginScreen();
+            }
+        }
+        
+        window.navigateTo = function(page) {
+            // Close modal if open before navigating
+            showEditProfileModal(false); 
+            
+            // Only allow navigation to non-auth pages if logged in
+            if ((page === 'feed' || page === 'newPost' || page === 'messages' || page === 'profile') && !userId) {
+                currentPage = 'login';
+            } else {
+                currentPage = page;
+            }
+            renderUI();
+        }
+
+        window.viewOtherUserProfile = function(targetUserId) {
+            // Mock: For now, we only render the current user's profile, but in a real app,
+            // this function would switch the 'currentPage' state to show the target user's profile.
+            if (targetUserId === userId) {
+                 navigateTo('profile');
+            } else {
+                alertBox.show(`Viewing profile for: User_${targetUserId.substring(0, 8)} (Mock)`, 'bg-blue-500');
+            }
+        }
+
+        // --- AUTHENTICATION HANDLERS ---
+        
+        window.handleSignUp = async function(event) {
+            event.preventDefault();
+            const form = event.target;
+            const email = form.email.value;
+            const password = form.password.value;
+            
+            if (password.length < 6) {
+                alertBox.show("Password must be at least 6 characters.", 'bg-yellow-500');
+                return;
+            }
+
+            try {
+                const userCredential = await createUserWithEmailAndPassword(auth, email, password);
+                
+                // Initialize user profile metadata document
+                await setDoc(getUserProfilePath(userCredential.user.uid), {
+                    username: `User_${userCredential.user.uid.substring(0, 8)}`,
+                    bio: 'Welcome to Reelo!',
+                    following: [],
+                    followers: [],
+                });
+
+                console.log("Signup successful:", userCredential.user.uid);
+                alertBox.show("Account created successfully! Logging in...", 'bg-green-500');
+            } catch (error) {
+                console.error("Signup error:", error.code, error.message);
+                
+                let displayMessage = 'Signup failed.';
+                switch (error.code) {
+                    case 'auth/email-already-in-use':
+                        displayMessage = 'This email is already in use. Try logging in.';
+                        break;
+                    case 'auth/invalid-email':
+                        displayMessage = 'The email address is not valid.';
+                        break;
+                    case 'auth/weak-password':
+                        displayMessage = 'Password is too weak. Must be at least 6 characters.';
+                        break;
+                    case 'auth/operation-not-allowed':
+                        displayMessage = 'Email/Password sign-up is not enabled. Please use the default login.';
+                        break;
+                    default:
+                        displayMessage = `Signup failed: ${error.message}`;
+                }
+                
+                alertBox.show(displayMessage, 'bg-red-500');
+            }
+        }
+
+        window.handleLogin = async function(event) {
+            event.preventDefault();
+            const form = event.target;
+            const email = form.email.value;
+            const password = form.password.value;
+
+            try {
+                const userCredential = await signInWithEmailAndPassword(auth, email, password);
+                console.log("Login successful:", userCredential.user.uid);
+                alertBox.show("Login successful!", 'bg-green-500');
+            } catch (error) {
+                console.error("Login error:", error.code, error.message);
+                
+                let displayMessage = 'Login failed.';
+                switch (error.code) {
+                    case 'auth/invalid-credential':
+                    case 'auth/wrong-password':
+                    case 'auth/user-not-found':
+                        displayMessage = 'Invalid email or password.';
+                        break;
+                    case 'auth/invalid-email':
+                        displayMessage = 'The email address is not valid.';
+                        break;
+                    case 'auth/operation-not-allowed':
+                        displayMessage = 'Email/Password login is not enabled. Please use the default login.';
+                        break;
+                    default:
+                        displayMessage = `Login failed: ${error.message}`;
+                }
+                
+                alertBox.show(displayMessage, 'bg-red-500');
+            }
+        }
+        
+        window.handleLogout = async function() {
+            try {
+                await signOut(auth);
+            } catch (error) {
+                console.error("Logout error:", error.message);
+                alertBox.show("Failed to log out.", 'bg-red-500');
+            }
+        }
+        
+        // --- PROFILE EDITING LOGIC (NEW FEATURE) ---
+
+        window.handleProfileUpdate = async function(event) {
+            event.preventDefault();
+            if (!userId) {
+                alertBox.show("Authentication required to update profile.", 'bg-red-500');
+                return;
+            }
+
+            const form = event.target;
+            const newUsername = form.newUsername.value.trim();
+            const newBio = form.newBio.value.trim();
+            const userRef = getUserProfilePath(userId);
+
+            if (!newUsername) {
+                alertBox.show("Username cannot be empty.", 'bg-yellow-500');
+                return;
+            }
+            
+            // Simple validation: Username length
+            if (newUsername.length > 20) {
+                alertBox.show("Username must be 20 characters or less.", 'bg-yellow-500');
+                return;
+            }
+
+            try {
+                await updateDoc(userRef, {
+                    username: newUsername,
+                    bio: newBio,
+                });
+                
+                // Hide the modal after success
+                showEditProfileModal(false);
+                alertBox.show("Profile updated successfully!", 'bg-green-500');
+            } catch (error) {
+                console.error("Error updating profile:", error);
+                alertBox.show(`Error updating profile: ${error.message}`, 'bg-red-500');
+            }
+        }
+        
+        window.showEditProfileModal = function(show) {
+            const modal = document.getElementById('edit-profile-modal');
+            if (!modal) return;
+
+            if (show) {
+                // Pre-fill current data
+                document.getElementById('edit-username-input').value = userProfileData.username || '';
+                document.getElementById('edit-bio-textarea').value = userProfileData.bio || '';
+                modal.classList.remove('hidden');
+            } else {
+                modal.classList.add('hidden');
+            }
+        }
+
+        // --- FOLLOW/UNFOLLOW LOGIC ---
+
+        window.toggleFollow = async function(targetUserId) {
+            if (!userId || targetUserId === userId) return;
+
+            const isFollowing = userProfileData.following.includes(targetUserId);
+
+            const currentUserRef = getUserProfilePath(userId);
+            const targetUserRef = getUserProfilePath(targetUserId);
+
+            try {
+                if (isFollowing) {
+                    // Unfollow
+                    await updateDoc(currentUserRef, { following: arrayRemove(targetUserId) });
+                    await updateDoc(targetUserRef, { followers: arrayRemove(userId) });
+                    alertBox.show(`Unfollowed User_${targetUserId.substring(0, 8)}`, 'bg-yellow-500');
+                } else {
+                    // Follow
+                    const targetDoc = await getDoc(targetUserRef);
+                    if (!targetDoc.exists()) {
+                         // Initialize target user's profile if it doesn't exist
+                         await setDoc(targetUserRef, { 
+                            username: `User_${targetUserId.substring(0, 8)}`, 
+                            bio: 'A new user on Reelo!', 
+                            following: [], 
+                            followers: arrayUnion(userId) // Add follower
+                        }, { merge: true });
+                    } else {
+                        await updateDoc(targetUserRef, { followers: arrayUnion(userId) });
+                    }
+
+                    await updateDoc(currentUserRef, { following: arrayUnion(targetUserId) });
+                    alertBox.show(`Now following User_${targetUserId.substring(0, 8)}!`, 'bg-green-500');
+                }
+                // The onSnapshot listener for user profile data will handle UI update
+            } catch (error) {
+                console.error("Error toggling follow status:", error);
+                alertBox.show("Failed to update follow status.", 'bg-red-500');
+            }
+        }
+
+
+        // --- FIRESTORE POST MANAGEMENT (LIKE) ---
+        
+        window.handleNewPost = async function(event) {
+            event.preventDefault();
+            if (!userId) {
+                alertBox.show("Authentication required to post.", 'bg-red-500');
+                return;
+            }
+            
+            const form = event.target;
+            const caption = form.caption.value;
+
+            if (!caption.trim()) {
+                alertBox.show("Caption cannot be empty.", 'bg-yellow-500');
+                return;
+            }
+
+            try {
+                await addDoc(collection(db, `artifacts/${appId}/public/data/posts`), {
+                    userId: userId,
+                    user: userProfileData.username, // Use real username here
+                    location: 'Reelo World',
+                    caption: caption,
+                    likes: [], 
+                    commentsCount: 0,
+                    timestamp: serverTimestamp(),
+                    imageUrl: '1:1' 
+                });
+                alertBox.show("Post created successfully!", 'bg-green-500');
+                form.caption.value = '';
+                navigateTo('feed');
+            } catch (error) {
+                console.error("Error creating post:", error);
+                alertBox.show(`Error creating post: ${error.message}`, 'bg-red-500');
+            }
+        }
+
+        window.toggleLike = async function(postId) {
+            if (!userId) {
+                alertBox.show("You must be logged in to like posts.", 'bg-red-500');
+                return;
+            }
+            
+            const post = postsData.find(p => p.id === postId);
+            if (!post) return;
+
+            const isLiked = post.likes.includes(userId);
+            const postRef = getPostPath(postId);
+
+            try {
+                await updateDoc(postRef, {
+                    likes: isLiked ? arrayRemove(userId) : arrayUnion(userId)
+                });
+            } catch (error) {
+                console.error("Error toggling like:", error);
+                alertBox.show("Failed to update like status.", 'bg-red-500');
+            }
+        }
+
+        // --- FIRESTORE LISTENERS ---
+
+        function setupPostListener() {
+            if (!db) return;
+            
+            const postsColRef = collection(db, `artifacts/${appId}/public/data/posts`);
+            const q = query(postsColRef);
+            
+            onSnapshot(q, (snapshot) => {
+                postsData = [];
+                snapshot.forEach((doc) => {
+                    const data = doc.data();
+                    postsData.push({
+                        id: doc.id,
+                        ...data,
+                        likes: data.likes || [],
+                        timestamp: data.timestamp ? data.timestamp.toDate() : new Date(),
+                    });
+                });
+                // Sort by time descending (newest first).
+                postsData.sort((a, b) => b.timestamp - a.timestamp);
+                
+                console.log("Posts updated:", postsData.length);
+                if (currentPage === 'feed' || currentPage === 'profile') {
+                    renderUI(); // Re-render the relevant page
+                }
+            }, (error) => {
+                console.error("Error listening to posts:", error);
+                if (userId) alertBox.show("Failed to fetch posts in real-time.", 'bg-red-500');
+            });
+        }
+        
+        function setupUserProfileListener(targetUserId) {
+            if (!db || !targetUserId) return;
+
+            const userRef = getUserProfilePath(targetUserId);
+
+            // Fetch the user's document once to ensure it exists
+            getDoc(userRef).then(async (docSnap) => {
+                if (!docSnap.exists()) {
+                    // Create minimal profile if it doesn't exist (e.g. they only posted once)
+                    await setDoc(userRef, { 
+                        username: `User_${targetUserId.substring(0, 8)}`, 
+                        bio: 'New Reelo member.',
+                        following: [],
+                        followers: [],
+                    });
+                }
+            });
+
+            // Set up real-time listener for the current user's profile metadata
+            onSnapshot(userRef, (docSnap) => {
+                let defaultUsername = `User_${targetUserId.substring(0, 8)}`;
+
+                if (docSnap.exists()) {
+                    const data = docSnap.data();
+                    userProfileData = {
+                        username: data.username || defaultUsername,
+                        bio: data.bio || 'Welcome to Reelo!',
+                        following: data.following || [],
+                        followers: data.followers || [],
+                    };
+                } else {
+                    // Profile document deleted or not found
+                    userProfileData = { following: [], followers: [], username: defaultUsername, bio: 'Profile not initialized.' };
+                }
+                
+                console.log("Profile data updated:", userProfileData);
+                
+                // Re-render if we are on a page that uses this data
+                if (currentPage === 'feed' || currentPage === 'profile') {
+                    renderUI();
+                }
+
+            }, (error) => {
+                console.error("Error listening to user profile:", error);
+            });
+        }
+
+        // --- FIREBASE INITIALIZATION ---
+
+        async function initFirebase() {
+            if (!firebaseConfig) {
+                console.error("Firebase config is missing or invalid. Check console for parsing errors.");
+                alertBox.show("Firebase configuration error. Cannot initialize.", 'bg-red-500');
+                return;
+            }
+
+            try {
+                app = initializeApp(firebaseConfig);
+                auth = getAuth(app);
+                db = getFirestore(app);
+
+                // 1. Register the listener first to handle state changes
+                onAuthStateChanged(auth, (user) => {
+                    if (user) {
+                        userId = user.uid;
+                        console.log("User authenticated:", userId);
+                        
+                        // Set initial page state upon successful auth
+                        if (currentPage === 'login' || currentPage === 'signup') {
+                            currentPage = 'feed';
+                        }
+                        
+                        // Start real-time listeners only after successful auth
+                        setupPostListener();
+                        setupUserProfileListener(userId);
+
+                    } else {
+                        userId = null;
+                        postsData = [];
+                        userProfileData = { following: [], followers: [], username: 'Loading...', bio: '' };
+                        console.log("User signed out.");
+                        currentPage = 'login'; 
+                    }
+                    renderUI(); // Re-render whenever auth state changes
+                });
+                
+                // 2. Attempt the environment-specific login (triggers onAuthStateChanged)
+                if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                    await signInWithCustomToken(auth, __initial_auth_token);
+                } else {
+                    await signInAnonymously(auth);
+                }
+                
+                // Initial render to show loading screen or login screen immediately
+                renderUI();
+
+            } catch (error) {
+                console.error("Firebase initialization failed:", error.message);
+                alertBox.show(`Initialization failed: ${error.message}`, 'bg-red-500');
+            }
+        }
+
+        // --- UI COMPONENT FUNCTIONS (Login/Signup) ---
+        
+        function createLoginScreen() {
+            return `
+                <div class="min-h-screen flex items-center justify-center p-4">
+                    <div class="w-full max-w-sm p-8 bg-gray-900 rounded-xl shadow-2xl border border-gray-800">
+                        <h1 class="text-5xl reelo-logo text-center mb-8">Reelo</h1>
+                        <h2 class="text-xl font-semibold text-center mb-6">Log In to continue</h2>
+                        
+                        <form onsubmit="handleLogin(event)">
+                            <div class="mb-4">
+                                <input type="email" name="email" placeholder="Email" required 
+                                    class="w-full p-3 bg-gray-800 rounded-lg border border-gray-700 focus:ring-2 focus:ring-pink-500 focus:border-pink-500 transition"
+                                />
+                            </div>
+                            <div class="mb-6">
+                                <input type="password" name="password" placeholder="Password" required 
+                                    class="w-full p-3 bg-gray-800 rounded-lg border border-gray-700 focus:ring-2 focus:ring-pink-500 focus:border-pink-500 transition"
+                                />
+                            </div>
+                            <button type="submit" class="w-full py-3 bg-pink-600 hover:bg-pink-700 rounded-lg font-bold transition duration-300 shadow-lg">
+                                Log In
+                            </button>
+                        </form>
+
+                        <div class="mt-6 text-center text-sm">
+                            <p class="text-gray-400">Don't have an account? 
+                                <button onclick="navigateTo('signup')" class="text-pink-400 hover:text-pink-300 font-semibold transition">Sign up</button>
+                            </p>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+        
+        function createSignupScreen() {
+            return `
+                <div class="min-h-screen flex items-center justify-center p-4">
+                    <div class="w-full max-w-sm p-8 bg-gray-900 rounded-xl shadow-2xl border border-gray-800">
+                        <h1 class="text-5xl reelo-logo text-center mb-8">Reelo</h1>
+                        <h2 class="text-xl font-semibold text-center mb-6">Create a New Account</h2>
+                        
+                        <form onsubmit="handleSignUp(event)">
+                            <div class="mb-4">
+                                <input type="email" name="email" placeholder="Email" required 
+                                    class="w-full p-3 bg-gray-800 rounded-lg border border-gray-700 focus:ring-2 focus:ring-pink-500 focus:border-pink-500 transition"
+                                />
+                            </div>
+                            <div class="mb-6">
+                                <input type="password" name="password" placeholder="Password (min 6 characters)" required 
+                                    class="w-full p-3 bg-gray-800 rounded-lg border border-gray-700 focus:ring-2 focus:ring-pink-500 focus:border-pink-500 transition"
+                                />
+                            </div>
+                            <button type="submit" class="w-full py-3 bg-pink-600 hover:bg-pink-700 rounded-lg font-bold transition duration-300 shadow-lg">
+                                Sign Up
+                            </button>
+                        </form>
+
+                        <div class="mt-6 text-center text-sm">
+                            <p class="text-gray-400">Already have an account? 
+                                <button onclick="navigateTo('login')" class="text-pink-400 hover:text-pink-300 font-semibold transition">Log in</button>
+                            </p>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+        
+        // --- MODAL COMPONENT ---
+        
+        function createEditProfileModal() {
+            // Note: The modal is hidden by default and controlled by showEditProfileModal(true/false)
+            return `
+                <div id="edit-profile-modal" class="hidden fixed inset-0 z-50 overflow-y-auto modal-backdrop flex items-center justify-center p-4">
+                    <div class="bg-gray-900 w-full max-w-lg p-8 rounded-xl shadow-2xl border border-gray-800 transform scale-100 transition-transform duration-300">
+                        <div class="flex justify-between items-center mb-6">
+                            <h3 class="text-2xl font-bold text-pink-400">Edit Profile</h3>
+                            <button onclick="showEditProfileModal(false)" class="text-gray-400 hover:text-white transition">
+                                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                            </button>
+                        </div>
+                        
+                        <form onsubmit="handleProfileUpdate(event)">
+                            <div class="mb-4">
+                                <label for="edit-username-input" class="block text-sm font-medium mb-2 text-gray-400">Username (max 20 chars)</label>
+                                <input type="text" id="edit-username-input" name="newUsername" required maxlength="20"
+                                    class="w-full p-3 bg-gray-800 rounded-lg border border-gray-700 focus:ring-2 focus:ring-pink-500 focus:border-pink-500 transition"
+                                />
+                            </div>
+                            
+                            <div class="mb-6">
+                                <label for="edit-bio-textarea" class="block text-sm font-medium mb-2 text-gray-400">Bio / About Me</label>
+                                <textarea id="edit-bio-textarea" name="newBio" rows="4"
+                                    class="w-full p-3 bg-gray-800 rounded-lg border border-gray-700 focus:ring-2 focus:ring-pink-500 focus:border-pink-500 transition resize-none"
+                                    placeholder="Tell the world a bit about yourself."></textarea>
+                            </div>
+                            
+                            <button type="submit" class="w-full py-3 bg-pink-600 hover:bg-pink-700 rounded-lg font-bold transition duration-300 shadow-lg">
+                                Save Changes
+                            </button>
+                        </form>
+                    </div>
+                </div>
+            `;
+        }
+
+        // --- AUTHENTICATED LAYOUT (Header & Main Content) ---
+
+        function createAuthenticatedLayout() {
+            const userDisplay = userId ? userProfileData.username : 'Guest';
+            const initial = userDisplay.charAt(0).toUpperCase();
+
+            return `
+                <!-- Header / Navigation Bar -->
+                <header class="sticky top-0 z-50 bg-black border-b border-gray-800 shadow-lg">
+                    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
+                        <!-- Logo -->
+                        <button onclick="navigateTo('feed')" class="text-3xl reelo-logo cursor-pointer transition hover:opacity-80">
+                            Reelo
+                        </button>
+
+                        <!-- Icons -->
+                        <div class="flex space-x-5 items-center">
+                            <!-- New Post Button -->
+                            <button onclick="navigateTo('newPost')" class="text-white hover:text-pink-400 transition">
+                                <svg class="w-7 h-7" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v3m0 0v3m0-3h3m-3 0H9m12 0a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                            </button>
+                            <!-- Messages/Chat Button -->
+                            <button onclick="navigateTo('messages')" class="text-white hover:text-pink-400 transition">
+                                <svg class="w-7 h-7" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 10h.01M12 10h.01M16 10h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.525A9.86 9.86 0 013 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"></path></svg>
+                            </button>
+                            <!-- Profile Button -->
+                            <button onclick="navigateTo('profile')" class="w-8 h-8 rounded-full bg-pink-600 overflow-hidden border-2 border-white transition hover:scale-105 flex items-center justify-center text-sm font-bold">
+                                ${initial}
+                            </button>
+                        </div>
+                    </div>
+                </header>
+
+                <!-- Main Content Area -->
+                <main class="max-w-7xl mx-auto py-8 px-4 sm:px-6 lg:px-8 flex justify-center">
+                    <div class="w-full md:max-w-xl lg:w-2/3 xl:w-1/2">
+                        <!-- Content depends on currentPage state -->
+                        <div id="page-content"></div>
+                    </div>
+
+                    <!-- Right Sidebar (Profile and Suggestions) - Hidden on mobile -->
+                    <div class="hidden lg:block w-1/3 xl:w-1/4 ml-10 pt-4 sticky top-20 h-full">
+                        <div class="flex items-center mb-6">
+                            <button onclick="navigateTo('profile')" class="flex items-center hover:opacity-80 transition">
+                                <div class="w-14 h-14 rounded-full bg-pink-600 mr-4 border-2 border-white flex items-center justify-center text-xl font-bold">
+                                    ${initial}
+                                </div>
+                                <div>
+                                    <p class="font-semibold text-sm">${userProfileData.username}</p>
+                                    <p class="text-gray-400 text-sm">ID: ${userId ? userId.substring(0, 8) : ''}...</p>
+                                </div>
+                            </button>
+                            <button onclick="handleLogout()" class="ml-auto text-pink-400 font-bold text-xs hover:text-white transition">Log Out</button>
+                        </div>
+
+                        <div class="text-sm">
+                            <div class="flex justify-between items-center mb-4">
+                                <p class="text-gray-400 font-semibold">Suggestions for you</p>
+                                <button class="text-white font-bold text-xs hover:text-gray-400 transition">See All</button>
+                            </div>
+                            
+                            <!-- Mock Suggestions (Could eventually implement a suggestion logic) -->
+                            <div class="space-y-4">
+                                <div class="flex items-center">
+                                    <div class="w-10 h-10 rounded-full bg-red-500 mr-3"></div>
+                                    <div class="text-sm">
+                                        <p class="font-semibold">friend_one_x</p>
+                                        <p class="text-gray-400 text-xs">Followed by a user</p>
+                                    </div>
+                                    <button class="ml-auto text-pink-400 font-bold text-xs hover:text-white transition">Follow</button>
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <footer class="mt-8 text-xs text-gray-500 space-y-2">
+                            <p>About &middot; Help &middot; Press &middot; API &middot; Jobs</p>
+                            <p>&copy; 2025 Reelo from GEMINI</p>
+                        </footer>
+                    </div>
+                </main>
+                
+                <!-- Profile Edit Modal (Injected into the layout) -->
+                ${createEditProfileModal()}
+            `;
+        }
+
+        // --- SPECIFIC PAGE RENDERING ---
+
+        function renderFeedContent() {
+            const content = document.getElementById('page-content');
+            if (!content) return;
+            
+            // Show loading state if posts data is still being fetched (important for initial load)
+            if (postsData.length === 0 && userId) {
+                content.innerHTML = `
+                    <div class="text-center py-20">
+                        <svg class="animate-spin h-8 w-8 text-pink-500 mx-auto mb-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                            <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                        </svg>
+                        <p class="text-lg text-gray-400">Loading Feed and Stories...</p>
+                    </div>
+                `;
+                return;
+            }
+
+            // 1. Stories Bar (Mockup)
+            const storiesHTML = mockStories.map(createStoryElement).join('');
+            
+            // 2. Posts Feed (Real Data)
+            const postsHTML = postsData.map(createPostElement).join('');
+
+            content.innerHTML = `
+                <!-- Stories Bar -->
+                <div id="stories-bar" class="flex overflow-x-scroll space-x-4 p-4 border-b border-gray-800 mb-8 stories-scroll bg-gray-900 rounded-lg shadow-xl">
+                    ${storiesHTML}
+                </div>
+
+                <!-- Posts Feed -->
+                <div id="post-feed" class="space-y-10">
+                    ${postsData.length === 0 ? '<p class="text-center text-gray-500 py-10">No posts yet! Be the first to post.</p>' : postsHTML}
+                </div>
+            `;
+        }
+
+        function renderProfileContent() {
+            const content = document.getElementById('page-content');
+            const profilePosts = postsData.filter(p => p.userId === userId);
+            const initial = userProfileData.username.charAt(0).toUpperCase();
+
+            content.innerHTML = `
+                <div class="space-y-8">
+                    <!-- Profile Header -->
+                    <div class="bg-gray-900 p-6 sm:p-8 rounded-xl shadow-2xl border border-gray-800">
+                        <div class="flex items-center">
+                            <div class="w-24 h-24 sm:w-32 sm:h-32 rounded-full bg-pink-600 border-4 border-black flex items-center justify-center text-4xl sm:text-6xl font-extrabold flex-shrink-0">
+                                ${initial}
+                            </div>
+                            <div class="ml-6 sm:ml-10 flex-grow">
+                                <p class="text-2xl sm:text-3xl font-bold mb-1">${userProfileData.username}</p>
+                                <p class="text-gray-400 text-sm mb-4">ID: ${userId}</p>
+                                
+                                <div class="flex space-x-6 sm:space-x-8 text-center mb-4">
+                                    <div>
+                                        <p class="font-bold text-lg">${profilePosts.length}</p>
+                                        <p class="text-gray-400 text-xs">Posts</p>
+                                    </div>
+                                    <div>
+                                        <p class="font-bold text-lg">${userProfileData.followers.length}</p>
+                                        <p class="text-gray-400 text-xs">Followers</p>
+                                    </div>
+                                    <div>
+                                        <p class="font-bold text-lg">${userProfileData.following.length}</p>
+                                        <p class="text-gray-400 text-xs">Following</p>
+                                    </div>
+                                </div>
+                                
+                                <p class="text-sm text-gray-300 italic">"${userProfileData.bio || 'No bio set. Edit profile to add one!'}"</p>
+                                
+                                <!-- UPDATED: Button now opens the modal -->
+                                <button onclick="showEditProfileModal(true)" class="mt-4 w-full sm:w-auto py-2 px-4 text-xs font-semibold rounded-lg border border-gray-600 hover:bg-gray-800 transition">
+                                    Edit Profile
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Post Grid (Simple List View for now) -->
+                    <h3 class="text-2xl font-bold text-pink-400 border-b border-gray-800 pb-2">Your Posts</h3>
+                    <div class="space-y-6">
+                        ${profilePosts.length === 0 
+                            ? '<p class="text-center text-gray-500 py-10">You have no posts yet. Share something!</p>' 
+                            : profilePosts.map(createPostElement).join('')
+                        }
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderNewPostContent() {
+            const content = document.getElementById('page-content');
+            content.innerHTML = `
+                <div class="bg-gray-900 p-8 rounded-xl shadow-2xl border border-gray-800">
+                    <h2 class="text-3xl font-bold mb-6 text-pink-400">Create New Post</h2>
+                    <form onsubmit="handleNewPost(event)">
+                        <div class="mb-6">
+                            <label for="caption" class="block text-sm font-medium mb-2 text-gray-400">Caption / Description (e.g., Reel)</label>
+                            <textarea id="caption" name="caption" rows="5" required 
+                                class="w-full p-3 bg-gray-800 rounded-lg border border-gray-700 focus:ring-2 focus:ring-pink-500 focus:border-pink-500 transition resize-none"
+                                placeholder="What's on your mind?"></textarea>
+                        </div>
+                        
+                        <!-- Mock Upload Button for UI (Real file upload is complex) -->
+                        <div class="mb-6 border-2 border-dashed border-gray-700 p-8 rounded-lg text-center cursor-pointer hover:bg-gray-800 transition">
+                            <svg class="w-10 h-10 mx-auto text-gray-500 mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"></path></svg>
+                            <p class="text-gray-400">Click to upload Video or Photo</p>
+                        </div>
+
+                        <button type="submit" class="w-full py-3 bg-pink-600 hover:bg-pink-700 rounded-lg font-bold transition duration-300 shadow-lg">
+                            Share Post
+                        </button>
+                    </form>
+                </div>
+            `;
+        }
+
+        function renderMessagesContent() {
+            const content = document.getElementById('page-content');
+            content.innerHTML = `
+                <div class="bg-gray-900 p-8 rounded-xl shadow-2xl border border-gray-800 h-96">
+                    <h2 class="text-3xl font-bold mb-6 text-pink-400">Messages & Chat</h2>
+                    <p class="text-gray-400 mb-6">This feature is a UI mockup for **chatting**, **massaging**, **calls**, and **videocalls**.</p>
+                    
+                    <div class="space-y-4">
+                        <div class="flex items-center p-3 bg-gray-800 rounded-lg hover:bg-gray-700 transition cursor-pointer">
+                            <div class="w-10 h-10 rounded-full bg-green-500 mr-3"></div>
+                            <div>
+                                <p class="font-semibold text-sm">Global Chat</p>
+                                <p class="text-gray-400 text-xs">Tap to send a message...</p>
+                            </div>
+                            <div class="ml-auto space-x-2">
+                                <button class="text-green-400 hover:text-white transition" onclick="alertBox.show('Initiating mock call...', 'bg-green-600')">
+                                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 5a2 2 0 012-2h3.28a1 1 0 01.948.684L10.5 9l2.5-3.5 2.5 3.5 1.272-3.316A1 1 0 0118.72 3H21a2 2 0 012 2v14a2 2 0 01-2 2H5a2 2 0 01-2-2V5z"></path></svg>
+                                </button>
+                                <button class="text-blue-400 hover:text-white transition" onclick="alertBox.show('Initiating mock video call...', 'bg-blue-600')">
+                                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 10l4.552-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.448.894L15 14M5 18H2a1 1 0 01-1-1v-2a1 1 0 011-1h3m14-5.5V9a2 2 0 00-2-2h-3.586a1 1 0 01-.707-.293L10 2l-6 6a2 2 0 00-2 2v6a2 2 0 002 2h4l4 4v-4h4a2 2 0 002-2v-4a2 2 0 00-2-2z"></path></svg>
+                                </button>
+                            </div>
+                        </div>
+                        <p class="text-sm text-gray-500">Tap the phone icon for a mock call, or the video icon for a mock video call.</p>
+                    </div>
+                </div>
+            `;
+        }
+
+        // --- MOCK DATA FOR FEED UI (STORIES) ---
+        
+        const mockStories = [
+            { user: 'you', color: 'bg-white border-4 border-gray-900', status: 'Your Story' },
+            { user: 'Reelo_Staff', color: 'bg-pink-500', status: 'Active' },
+            { user: 'dev_updates', color: 'bg-blue-500', status: '2 hours ago' },
+            { user: 'travel_tips', color: 'bg-green-500', status: 'Active' },
+            { user: 'local_news', color: 'bg-red-500', status: '23 hours ago' },
+            { user: 'design_inspo', color: 'bg-purple-500', status: 'Active' },
+        ];
+        
+        // --- FEED ELEMENT CREATION ---
+
+        function createStoryElement(story) {
+            const profileInitial = story.user.charAt(0).toUpperCase();
+            const ringClass = story.user === 'you' ? '' : 'story-ring';
+            const userText = story.user === 'you' ? 'Your Story' : story.user;
+
+            return `
+                <div class="flex flex-col items-center flex-shrink-0 w-20 cursor-pointer hover:opacity-80 transition">
+                    <div class="w-16 h-16 ${ringClass} rounded-full overflow-hidden flex items-center justify-center">
+                        <div class="w-full h-full rounded-full ${story.color} flex items-center justify-center">
+                            <span class="text-xl font-bold text-gray-900">${profileInitial}</span>
+                        </div>
+                    </div>
+                    <p class="text-xs mt-1 text-center truncate w-full">${userText}</p>
+                </div>
+            `;
+        }
+
+
+        function createPostElement(post) {
+            const [w, h] = post.imageUrl.split(':');
+            const placeholderUrl = `https://placehold.co/600x${(600 * h) / w}/374151/fff?text=Reelo+Post`;
+            
+            const isLiked = post.likes.includes(userId); 
+            const heartColor = isLiked ? 'fill-red-500 stroke-red-500' : 'fill-none stroke-white';
+            const postUserDisplay = post.user || `User_${post.userId.substring(0, 8)}`;
+            const isCurrentUserPost = post.userId === userId;
+            const isFollowing = userProfileData.following.includes(post.userId);
+
+            const followButton = !isCurrentUserPost ? `
+                <button onclick="toggleFollow('${post.userId}')" class="ml-auto text-pink-400 font-bold text-sm hover:text-white transition">
+                    ${isFollowing ? 'Unfollow' : 'Follow'}
+                </button>
+            ` : '';
+
+
+            // Convert timestamp to a readable format
+            const timeAgo = post.timestamp ? 
+                new Date(post.timestamp).toLocaleDateString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: 'numeric' }) : 
+                'just now';
+
+
+            return `
+                <div id="post-${post.id}" class="bg-gray-900 border border-gray-800 rounded-lg shadow-xl">
+                    <!-- Post Header -->
+                    <div class="flex items-center p-4">
+                        <button onclick="viewOtherUserProfile('${post.userId}')" class="flex items-center hover:opacity-80 transition">
+                            <div class="w-10 h-10 rounded-full bg-gray-600 mr-3 border-2 border-transparent hover:border-pink-500 transition flex items-center justify-center text-sm font-bold">
+                                ${postUserDisplay.charAt(0)}
+                            </div>
+                            <div>
+                                <p class="font-semibold text-sm cursor-pointer hover:underline">${postUserDisplay}</p>
+                                <p class="text-gray-400 text-xs">${post.location}</p>
+                            </div>
+                        </button>
+                        ${followButton}
+                    </div>
+
+                    <!-- Post Media (Placeholder) -->
+                    <div class="w-full bg-gray-800 flex items-center justify-center overflow-hidden">
+                        <img 
+                            src="${placeholderUrl}" 
+                            alt="Post by ${post.user}" 
+                            class="w-full object-cover"
+                            style="aspect-ratio: ${w}/${h};"
+                        >
+                    </div>
+
+                    <!-- Post Footer -->
+                    <div class="p-4">
+                        <!-- Action Icons -->
+                        <div class="flex justify-between items-center mb-3">
+                            <div class="flex space-x-4">
+                                <!-- Like Button (Real-Time) -->
+                                <button onclick="toggleLike('${post.id}')" class="like-button-${post.id} transition">
+                                    <svg class="w-7 h-7 ${heartColor} hover:text-red-500 transition" 
+                                         stroke="currentColor" 
+                                         stroke-width="2" 
+                                         viewBox="0 0 24 24" 
+                                         xmlns="http://www.w3.org/2000/svg">
+                                        <path stroke-linecap="round" stroke-linejoin="round" d="M4.318 6.318a4.5 4.5 0 000 6.364L12 20.364l7.682-7.682a4.5 4.5 0 00-6.364-6.364L12 7.636l-1.318-1.318a4.5 4.5 0 00-6.364 0z"></path>
+                                    </svg>
+                                </button>
+                                <!-- Comment Icon (Mock) -->
+                                <button class="text-white hover:text-pink-400 transition" onclick="alertBox.show('Comment functionality is a future feature!', 'bg-blue-500')">
+                                    <svg class="w-7 h-7" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.525A9.86 9.86 0 013 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"></path></svg>
+                                </button>
+                                <!-- Share Icon (Mock) -->
+                                <button class="text-white hover:text-pink-400 transition" onclick="alertBox.show('Sharing is caring! (Mock feature)', 'bg-yellow-500')">
+                                    <svg class="w-7 h-7 rotate-45" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"></path></svg>
+                                </button>
+                            </div >
+                            <!-- Save Icon -->
+                            <button class="text-white hover:text-pink-400 transition">
+                                <svg class="w-7 h-7" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" d="M5 5a2 2 0 012-2h10a2 2 0 012 2v16l-7-3.5L5 21V5z"></path></svg>
+                            </button>
+                        </div>
+
+                        <!-- Likes Count -->
+                        <p class="font-semibold text-sm mb-2"><span id="likes-count-${post.id}">${post.likes.length.toLocaleString()}</span> likes</p>
+
+                        <!-- Caption -->
+                        <div class="text-sm mb-2">
+                            <span class="font-semibold">${postUserDisplay}</span> ${post.caption}
+                        </div>
+                        
+                        <!-- View Comments (Mock) -->
+                        <p class="text-gray-400 text-sm mb-1 cursor-pointer hover:underline">View all ${post.commentsCount || 0} comments</p>
+
+                        <!-- Time Ago -->
+                        <p class="text-gray-500 text-xs">${timeAgo}</p>
+                    </div>
+                </div>
+            `;
+        }
+        
+        // --- CUSTOM ALERT BOX (To replace alert/confirm) ---
+        
+        const alertBox = {
+            show: (message, bgColor = 'bg-blue-500') => {
+                const container = document.getElementById('alert-box-container');
+                if (!container) return;
+                
+                const box = document.createElement('div');
+                box.className = `p-3 rounded-lg shadow-xl text-white font-medium mb-2 ${bgColor} transition transform ease-out duration-300 opacity-0 translate-y-full`;
+                box.textContent = message;
+                
+                container.appendChild(box);
+                
+                // Show animation
+                setTimeout(() => {
+                    box.classList.remove('opacity-0', 'translate-y-full');
+                    box.classList.add('opacity-100', 'translate-y-0');
+                }, 10);
+
+                // Hide animation
+                setTimeout(() => {
+                    box.classList.remove('opacity-100', 'translate-y-0');
+                    box.classList.add('opacity-0', 'translate-y-full');
+                    // Remove from DOM after transition
+                    setTimeout(() => {
+                        container.removeChild(box);
+                    }, 300);
+                }, 4000);
+            }
+        };
+
+        // Initialize Firebase and the application
+        window.onload = function() {
+            initFirebase();
+        };
+
+    </script>
+
+    <!-- Alert Box Container (Fixed Position) -->
+    <div id="alert-box-container" class="fixed bottom-0 right-0 m-4 z-[100] max-w-xs sm:max-w-sm">
+        <!-- Alerts will be injected here -->
+    </div>
+
+    <!-- Main Application Container -->
+    <div id="reelo-app-container">
+        <!-- Content will be injected by renderUI() based on state (login/feed) -->
+    </div>
+
+</body>
+</html>
